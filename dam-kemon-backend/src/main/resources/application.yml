@@ -2,6 +2,12 @@ server:
   port: ${SERVER_PORT:8080}
 
 spring:
+  # Auto-import .env from the working directory.
+  # Spring Boot reads it as a properties file (KEY=VALUE), so KEY becomes a
+  # Spring property and ${KEY} placeholders below resolve to its value.
+  # "optional:" prevents startup failure when the file is missing.
+  config:
+    import: "optional:file:./.env[.properties]"
   application:
     name: dam-kemon
   data:

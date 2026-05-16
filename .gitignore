@@ -1,0 +1,15 @@
+# Environment files (NEVER commit these — they contain secrets)
+.env
+.env.local
+.env.*.local
+*.env
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Large local binaries
+*.dmg
+*.zip
