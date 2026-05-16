@@ -29,7 +29,9 @@ import java.util.stream.Collectors;
 public class ScraperEngine {
 
     private static final Logger log = LoggerFactory.getLogger(ScraperEngine.class);
-    private static final long PER_SCRAPER_TIMEOUT_MS = 12_000;
+    // Aggressive timeout: we'd rather return 6 results in 5s than 7 in 15s.
+    // Slow scrapers get skipped this round; cache hides this on subsequent calls.
+    private static final long PER_SCRAPER_TIMEOUT_MS = 5_000;
 
     private final List<EcommerceScraper> scrapers;
     private final QueryClassifier classifier;
@@ -78,8 +80,11 @@ public class ScraperEngine {
         }
 
         try {
+            // Total wait = per-scraper timeout + 1s grace. Anything not done by
+            // then is abandoned for this request (their result lands in cache
+            // on a later call).
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                    .get(PER_SCRAPER_TIMEOUT_MS + 3_000, TimeUnit.MILLISECONDS);
+                    .get(PER_SCRAPER_TIMEOUT_MS + 1_000, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             log.warn("Some scrapers timed out for query '{}': {}", query, e.getMessage());
         }
