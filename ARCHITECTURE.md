@@ -248,16 +248,17 @@ classDiagram
 
 | Algorithm | Where | Big-O | What it buys us |
 |---|---|---|---|
-| **QueryClassifier** (keyword scan) | `ScraperEngine.routeForIntent` + `ResultValidator` | O(categories × keywords) per query | Routes only relevant sites; kills Rokomari-for-AC. |
+| **QueryClassifier** powered by **Aho-Corasick** automaton (305 kw + 50 brands) | `ScraperEngine.routeForIntent` + `ResultValidator` | O(\|query\| + matches) per call — single pass, no matter how many patterns | Routes only relevant sites; kills Rokomari-for-AC. Scales to 10 000+ keywords with no slowdown. |
 | **PriceParser** (regex on tokenized text) | every scraper | O(\|text\|) | Rejects v0.101 / IDs / fractions — kills the ৳0.101 bug. |
 | **ResultValidator** (Jaccard + contain + price range + accessory blacklist) | `ScraperEngine` | O(N × \|name\|) | Drops "iPhone 15 Pro Case" when asked for the phone. |
-| **Caffeine LSH-aware cache** | `SearchService` | O(1) lookup | First call ~5 s, cached calls ~10 ms (500× faster). |
+| **MinHash + LSH** (128 hashes, 32 bands) | `SearchService.search` dedup | O(BANDS) ≈ O(32) candidate lookup per result | Merges "Apple iPhone 15 ProMax 256 GB" (Pickaboo) with "iPhone 15 Pro Max 256GB Titanium" (Daraz) into one product card. Used to be O(n²) Jaccard. |
+| **Caffeine cache** | `SearchService` | O(1) lookup | First call ~5 s, cached calls ~10 ms (500× faster). |
 
-### 4b. Built and ready to wire (the next algorithmic uplift)
+### 4b. Built and ready to wire (next iterations)
 
-These are committed as classes; the next sprint is to swap them into the call sites.
+**Trigram inverted index** — typo-tolerant fuzzy search & autocomplete. Built in `intelligence/TrigramIndex.java`. Not yet wired — earmarked for the autocomplete dropdown and as a backup signal when MinHash misses borderline matches.
 
-**MinHash + LSH — cross-site product deduplication**
+### 4c. MinHash + LSH — cross-site product deduplication
 
 ```mermaid
 flowchart LR
@@ -437,10 +438,10 @@ dam-kemon-backend/
     │   ├── QueryClassifier.java       # rule-based, ~200 keywords
     │   ├── PriceParser.java
     │   ├── ResultValidator.java
-    │   ├── Shingler.java              # k-shingles
-    │   ├── MinHashLSH.java            # ready, not yet wired
-    │   ├── TrigramIndex.java          # ready, not yet wired
-    │   └── AhoCorasick.java           # ready, not yet wired
+    │   ├── Shingler.java              # k-shingles (used by MinHashLSH + TrigramIndex)
+    │   ├── MinHashLSH.java            # WIRED — SearchService dedup
+    │   ├── AhoCorasick.java           # WIRED — QueryClassifier keyword scan
+    │   └── TrigramIndex.java          # ready, not yet wired (autocomplete next)
     ├── model/                         # Mongo @Document entities
     ├── repository/                    # Spring Data interfaces
     └── DamKemonApplication.java       # @EnableCaching @EnableScheduling

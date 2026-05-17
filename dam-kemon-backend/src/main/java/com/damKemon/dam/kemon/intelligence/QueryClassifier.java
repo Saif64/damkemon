@@ -1,5 +1,6 @@
 package com.damKemon.dam.kemon.intelligence;
 
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -164,6 +165,38 @@ public class QueryClassifier {
         BRAND_CATEGORIES.put(brand, new HashSet<>(Arrays.asList(cats)));
     }
 
+    // ====== Aho-Corasick automata built once at startup ======
+    // One automaton matches every (category × keyword) pair in a single pass
+    // over the query. Payload encodes weight (3 for multi-word, 2 for token)
+    // and the category to credit.
+    private AhoCorasick<KwHit> keywordAutomaton;
+    private AhoCorasick<BrandHit> brandAutomaton;
+
+    private record KwHit(ProductCategory category, int weight, boolean multiWord) {}
+    private record BrandHit(String brand, Set<ProductCategory> categories) {}
+
+    @PostConstruct
+    void buildAutomata() {
+        keywordAutomaton = new AhoCorasick<>();
+        for (Map.Entry<ProductCategory, Set<String>> e : KW.entrySet()) {
+            for (String kw : e.getValue()) {
+                boolean multi = kw.contains(" ");
+                keywordAutomaton.add(kw, new KwHit(e.getKey(), multi ? 3 : 2, multi));
+            }
+        }
+        keywordAutomaton.build();
+
+        brandAutomaton = new AhoCorasick<>();
+        for (Map.Entry<String, Set<ProductCategory>> e : BRAND_CATEGORIES.entrySet()) {
+            brandAutomaton.add(e.getKey(), new BrandHit(e.getKey(), e.getValue()));
+        }
+        brandAutomaton.build();
+
+        int kwCount = KW.values().stream().mapToInt(Set::size).sum();
+        log.info("QueryClassifier: built Aho-Corasick with {} keywords + {} brands",
+                kwCount, BRAND_CATEGORIES.size());
+    }
+
     public QueryIntent classify(String rawQuery) {
         if (rawQuery == null || rawQuery.isBlank()) {
             return QueryIntent.builder().original("").normalized("").confidence(0).build();
@@ -172,33 +205,23 @@ public class QueryClassifier {
         String normalized = PUNCT.matcher(rawQuery.toLowerCase()).replaceAll(" ")
                 .replaceAll("\\s+", " ").trim();
 
-        // brand detection — match multi-word brands first
+        // ===== single Aho-Corasick pass picks up every brand + keyword =====
+        // O(|query| + matches) instead of O(brands + categories × keywords).
         List<String> detectedBrands = new ArrayList<>();
         Set<ProductCategory> brandAffinity = new LinkedHashSet<>();
-        for (String brand : BRAND_CATEGORIES.keySet()) {
-            if (normalized.contains(brand)) {
-                detectedBrands.add(brand);
-                brandAffinity.addAll(BRAND_CATEGORIES.get(brand));
-            }
+        for (AhoCorasick.Hit<BrandHit> hit : brandAutomaton.findAll(normalized)) {
+            detectedBrands.add(hit.payload().brand());
+            brandAffinity.addAll(hit.payload().categories());
         }
 
-        // keyword score per category
-        String[] tokens = normalized.split("\\s+");
         Map<ProductCategory, Integer> scores = new EnumMap<>(ProductCategory.class);
-
-        for (Map.Entry<ProductCategory, Set<String>> e : KW.entrySet()) {
-            int s = 0;
-            for (String kw : e.getValue()) {
-                if (kw.contains(" ")) {
-                    if (normalized.contains(kw)) s += 3; // multi-word phrase bonus
-                } else {
-                    for (String tok : tokens) if (tok.equals(kw)) s += 2;
-                }
-            }
-            // brand affinity bonus
-            if (brandAffinity.contains(e.getKey())) s += 1;
-            if (s > 0) scores.put(e.getKey(), s);
+        for (AhoCorasick.Hit<KwHit> hit : keywordAutomaton.findAll(normalized)) {
+            scores.merge(hit.payload().category(), hit.payload().weight(), Integer::sum);
         }
+        // brand affinity bonus
+        for (ProductCategory c : brandAffinity) scores.merge(c, 1, Integer::sum);
+
+        String[] tokens = normalized.split("\\s+");
 
         // model-looking tokens (e.g. "s24", "wh-1000xm5", "x1")
         List<String> modelTokens = new ArrayList<>();

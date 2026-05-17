@@ -1,6 +1,8 @@
 package com.damKemon.dam.kemon.service;
 
 import com.damKemon.dam.kemon.dto.SearchResponse;
+import com.damKemon.dam.kemon.intelligence.MinHashLSH;
+import com.damKemon.dam.kemon.intelligence.MinHashLSH.Match;
 import com.damKemon.dam.kemon.intelligence.QueryIntent;
 import com.damKemon.dam.kemon.intelligence.ResultValidator.ScoredResult;
 import com.damKemon.dam.kemon.model.Product;
@@ -17,6 +19,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 @Service
@@ -52,9 +55,16 @@ public class SearchService {
         QueryIntent intent = engineResult.intent;
         Map<String, List<ScoredResult>> bySite = engineResult.bySite;
 
-        // dedupe scored results into Products
-        Map<String, Product> deduplicatedProducts = new LinkedHashMap<>();
+        // ===== MinHash + LSH dedup =====
+        // Replaces the old O(n²) Jaccard pass: each new product name is hashed
+        // and looked up in the LSH index in O(BANDS) ≈ O(32). Threshold of
+        // 0.55 means "Apple iPhone 15 ProMax 256 GB Black" and "iPhone 15 Pro
+        // Max 256GB Titanium" collide as the same product.
+        MinHashLSH lsh = new MinHashLSH();
+        Map<String, Product> productsById = new LinkedHashMap<>();
         Map<String, Double> productScore = new HashMap<>();
+        AtomicInteger nextId = new AtomicInteger();
+        int merges = 0;
 
         for (Map.Entry<String, List<ScoredResult>> entry : bySite.entrySet()) {
             String siteName = entry.getKey();
@@ -66,13 +76,10 @@ public class SearchService {
                 ScrapedProduct sp = scored.product;
                 if (sp.getName() == null || sp.getName().isBlank() || sp.getPrice() == null) continue;
 
-                String normalized = normalizeName(sp.getName());
-                Product existing = findSimilarProduct(deduplicatedProducts, normalized);
-
                 SitePrice sitePrice = SitePrice.builder()
                         .siteName(siteName)
                         .siteSlug(siteSlug)
-                        .productUrl(sp.getProductUrl())   // <-- real URL preserved
+                        .productUrl(sp.getProductUrl())   // real URL preserved
                         .price(sp.getPrice())
                         .originalPrice(sp.getOriginalPrice())
                         .discount(discount(sp.getOriginalPrice(), sp.getPrice()))
@@ -83,32 +90,40 @@ public class SearchService {
                         .lastUpdated(LocalDateTime.now())
                         .build();
 
-                if (existing != null) {
-                    // avoid duplicating same site twice
-                    existing.getPrices().removeIf(p -> Objects.equals(p.getSiteName(), siteName));
-                    existing.getPrices().add(sitePrice);
-                    productScore.merge(normalized, scored.score, Math::max);
-                    updateAggregateFields(existing);
-                } else {
-                    Product product = Product.builder()
-                            .name(sp.getName())
-                            .slug(generateSlug(sp.getName()))
-                            .category(intent.primaryCategory().getLabel())
-                            .imageUrl(sp.getImageUrl())
-                            .prices(new ArrayList<>(List.of(sitePrice)))
-                            .lastScraped(LocalDateTime.now())
-                            .createdAt(LocalDateTime.now())
-                            .updatedAt(LocalDateTime.now())
-                            .build();
-                    updateAggregateFields(product);
-                    deduplicatedProducts.put(normalized, product);
-                    productScore.put(normalized, scored.score);
+                Match match = lsh.findBest(sp.getName(), 0.55);
+                if (match != null) {
+                    Product existing = productsById.get(match.id());
+                    if (existing != null) {
+                        existing.getPrices().removeIf(p -> Objects.equals(p.getSiteName(), siteName));
+                        existing.getPrices().add(sitePrice);
+                        productScore.merge(match.id(), scored.score, Math::max);
+                        updateAggregateFields(existing);
+                        merges++;
+                        continue;
+                    }
                 }
+                // new product
+                String id = "p" + nextId.getAndIncrement();
+                Product product = Product.builder()
+                        .name(sp.getName())
+                        .slug(generateSlug(sp.getName()))
+                        .category(intent.primaryCategory().getLabel())
+                        .imageUrl(sp.getImageUrl())
+                        .prices(new ArrayList<>(List.of(sitePrice)))
+                        .lastScraped(LocalDateTime.now())
+                        .createdAt(LocalDateTime.now())
+                        .updatedAt(LocalDateTime.now())
+                        .build();
+                updateAggregateFields(product);
+                productsById.put(id, product);
+                productScore.put(id, scored.score);
+                lsh.add(id, sp.getName(), product);
             }
         }
+        log.info("LSH dedup: {} unique products, {} cross-site merges", productsById.size(), merges);
 
         // sort by score desc (best matches first)
-        List<Map.Entry<String, Product>> ranked = new ArrayList<>(deduplicatedProducts.entrySet());
+        List<Map.Entry<String, Product>> ranked = new ArrayList<>(productsById.entrySet());
         ranked.sort((a, b) -> Double.compare(
                 productScore.getOrDefault(b.getKey(), 0.0),
                 productScore.getOrDefault(a.getKey(), 0.0)));
@@ -144,30 +159,6 @@ public class SearchService {
     }
 
     // ---------- helpers ----------
-    private String normalizeName(String name) {
-        return name.toLowerCase()
-                .replaceAll("[^a-z0-9\\s]", "")
-                .replaceAll("\\s+", " ")
-                .trim();
-    }
-
-    private Product findSimilarProduct(Map<String, Product> products, String normalizedName) {
-        if (products.containsKey(normalizedName)) return products.get(normalizedName);
-        for (Map.Entry<String, Product> e : products.entrySet()) {
-            if (areSimilar(e.getKey(), normalizedName)) return e.getValue();
-        }
-        return null;
-    }
-
-    private boolean areSimilar(String a, String b) {
-        Set<String> wa = new HashSet<>(Arrays.asList(a.split("\\s+")));
-        Set<String> wb = new HashSet<>(Arrays.asList(b.split("\\s+")));
-        Set<String> inter = new HashSet<>(wa); inter.retainAll(wb);
-        Set<String> union = new HashSet<>(wa); union.addAll(wb);
-        if (union.isEmpty()) return false;
-        return (double) inter.size() / union.size() > 0.7;
-    }
-
     private void updateAggregateFields(Product product) {
         List<SitePrice> prices = product.getPrices();
         if (prices == null || prices.isEmpty()) return;
